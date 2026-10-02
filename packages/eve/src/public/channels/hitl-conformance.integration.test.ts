@@ -5,9 +5,18 @@ import {
   type ChannelDriver,
   withChannelConversation,
 } from "#internal/testing/channel-conformance/harness.js";
-import { chatSdkDriver } from "#internal/testing/channel-conformance/chat-sdk-driver.js";
+import {
+  chatSdkDriver,
+  chatSdkTextDriver,
+} from "#internal/testing/channel-conformance/chat-sdk-driver.js";
+import { discordDriver } from "#internal/testing/channel-conformance/discord-driver.js";
+import { githubDriver } from "#internal/testing/channel-conformance/github-driver.js";
+import { linearDriver } from "#internal/testing/channel-conformance/linear-driver.js";
+import { linqDriver } from "#internal/testing/channel-conformance/linq-driver.js";
 import { slackDriver } from "#internal/testing/channel-conformance/slack-driver.js";
+import { teamsDriver } from "#internal/testing/channel-conformance/teams-driver.js";
 import { telegramDriver } from "#internal/testing/channel-conformance/telegram-driver.js";
+import { twilioDriver } from "#internal/testing/channel-conformance/twilio-driver.js";
 
 interface BrokenCell {
   readonly reason: string;
@@ -27,7 +36,38 @@ interface BrokenCell {
 const channels: readonly {
   readonly driver: () => ChannelDriver;
   readonly broken?: Partial<Record<HitlRule, BrokenCell>>;
-}[] = [{ driver: chatSdkDriver }, { driver: slackDriver }, { driver: telegramDriver }];
+}[] = [
+  { driver: chatSdkDriver },
+  {
+    driver: chatSdkTextDriver,
+    broken: {
+      "a rendered question shows every option a person can choose": {
+        reason: "#3712: the card's fallback text is only the prompt",
+        symptom: /the question showed \[\]/,
+      },
+    },
+  },
+  { driver: discordDriver },
+  { driver: githubDriver },
+  { driver: linearDriver },
+  { driver: linqDriver },
+  { driver: slackDriver },
+  { driver: teamsDriver },
+  { driver: telegramDriver },
+  {
+    driver: twilioDriver,
+    broken: {
+      "a rendered question shows every option a person can choose": {
+        reason: "the channel never sends the question (no input.requested handler)",
+        symptom: /Timed out waiting for the question "Which day works for the review\?" on twilio/,
+      },
+      "a text reply matching an option answers the only pending question": {
+        reason: "the channel never sends the question (no input.requested handler)",
+        symptom: /Timed out waiting for the question "Which day works for the review\?" on twilio/,
+      },
+    },
+  },
+];
 
 describe.each(channels.map((entry) => ({ ...entry, name: entry.driver().name })))(
   "$name HITL contract",
