@@ -63,6 +63,7 @@ import {
   type SlackTaskCardState,
   withTaskCards,
 } from "#public/channels/slack/task-card.js";
+import type { SlackThreadStatus } from "#public/channels/slack/thread-status.js";
 import {
   parseMessageEvent,
   type SlackEvent,
@@ -238,12 +239,10 @@ export interface SlackChannelState {
    */
   pendingToolCallMessage?: string | null;
   /**
-   * Last reasoning-derived typing indicator sent by the default
-   * `reasoning.appended` handler. Used to surface substantial progressive
-   * extensions immediately while throttling smaller streamed deltas.
+   * The thread status the default renderer last set. A later model step shows
+   * it again, as does a new task card, which Slack clears the status for.
    */
-  lastReasoningTypingAtMs?: number | null;
-  lastReasoningTypingStatus?: string | null;
+  threadStatus?: SlackThreadStatus | null;
   /**
    * Connection name to Slack message ts. Each entry is the public
    * link-free status post created by the default
@@ -259,11 +258,14 @@ export interface SlackChannelState {
    */
   taskCards?: Record<string, SlackTaskCardState> | null;
   /**
-   * The turn with a task that settled since its last model step. The default
-   * `step.started` handler shows `Reviewing results...` for the step that reads
-   * the results.
+   * Tasks that settled since the turn's last model step: each named agent, or
+   * `null` for another task. The default `step.started` handler shows
+   * `Reviewing results...` for the step that reads them.
    */
-  pendingTaskResultsTurnId?: string | null;
+  pendingTaskResults?: {
+    readonly names: readonly (string | null)[];
+    readonly turnId: string;
+  } | null;
   /**
    * Principal id to Slack user id, recorded as each message or input response
    * is delivered. Default handlers use it to address the principal named on
@@ -870,8 +872,6 @@ export function slackChannel(config: SlackChannelConfig = {}): SlackChannel {
       triggeringUserId: null,
       triggeringMessageTs: null,
       pendingToolCallMessage: null,
-      lastReasoningTypingAtMs: null,
-      lastReasoningTypingStatus: null,
       pendingAuthMessageTs: {},
       pendingApprovalCards: {},
       slackUsersByPrincipal: {},
