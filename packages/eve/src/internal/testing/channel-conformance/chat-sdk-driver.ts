@@ -11,7 +11,11 @@ import {
   toPlainText,
 } from "#compiled/chat/index.js";
 import { createMemoryState } from "#compiled/@chat-adapter/state-memory/index.js";
-import type { ChannelDriver, PlatformCall } from "#internal/testing/channel-conformance/harness.js";
+import {
+  type ChannelDriver,
+  type PlatformCall,
+  numberedOptions,
+} from "#internal/testing/channel-conformance/harness.js";
 
 const ADAPTER = "conformance";
 const PERSON = { fullName: "Alice", isBot: false, isMe: false, userId: "alice", userName: "alice" };
@@ -76,11 +80,7 @@ export function chatSdkTextDriver(): ChannelDriver {
       if (!isPost(call) || typeof call.body !== "string" || !call.body.includes(prompt)) {
         return undefined;
       }
-      // #3715's fallback lists each choice as `"<id>" (<label>)`.
-      return [...call.body.matchAll(/"[^"]+" \(([^)]+)\)/gu)].map(([, label]) => ({
-        handle: label,
-        label: label!,
-      }));
+      return numberedOptions(call.body);
     },
     press() {
       throw new Error("A text-only Chat SDK adapter has nothing to press.");
