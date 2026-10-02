@@ -238,7 +238,7 @@ export type AgentTUIRenderer = {
   /**
    * Reports the server session id backing the conversation — pushed by the
    * runner once a send is accepted, and overwritten when a later session's
-   * turn is accepted. Deliberately sticky across `/reset` and interrupt
+   * turn is accepted. Deliberately sticky across `/new` and interrupt
    * recovery: the terminal renderer echoes the LAST session this TUI talked
    * to in the parting line on exit, so an interrupted conversation (whose
    * replacement session never ran a turn) can still be found again
@@ -283,7 +283,7 @@ export type AgentTUIRenderer = {
   /**
    * Clears the rendered transcript and resets per-conversation display
    * state, leaving the UI interactive on a fresh screen. Used by the
-   * `/reset` command to start a new session with a clean slate.
+   * `/new` command to start a new session with a clean slate.
    */
   reset?(): void;
   /**
@@ -781,7 +781,7 @@ export class EveTUIRunner {
         });
         return;
       }
-      case "reset":
+      case "new":
         await this.#resetSession();
         return;
       case "compact":
@@ -795,8 +795,8 @@ export class EveTUIRunner {
       case "clear":
         await this.#runSessionCommand({
           absent: "No active session to clear",
+          accepted: "Session context cleared",
           failed: "Couldn't clear the session",
-          dismissOnAccepted: true,
           invoke: () => this.#store.clear(),
         });
         return;
@@ -1031,9 +1031,8 @@ export class EveTUIRunner {
   /** Runs a session mutation and gives every control command one completion policy. */
   async #runSessionCommand(input: {
     readonly absent: string;
-    readonly accepted?: string;
+    readonly accepted: string;
     readonly failed: string;
-    readonly dismissOnAccepted?: boolean;
     readonly invoke: () => Promise<{ status: string }>;
   }): Promise<void> {
     if (this.#store.snapshot.session === undefined) {
@@ -1046,11 +1045,7 @@ export class EveTUIRunner {
         this.#finishCommand({ kind: "result", summary: input.absent });
         return;
       }
-      this.#finishCommand(
-        input.dismissOnAccepted === true
-          ? { kind: "dismiss" }
-          : { kind: "result", summary: input.accepted },
-      );
+      this.#finishCommand({ kind: "result", summary: input.accepted });
     } catch (error) {
       this.#finishCommand({
         kind: "result",
