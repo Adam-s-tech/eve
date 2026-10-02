@@ -1637,13 +1637,28 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
           ) {
             throw new EmptyModelResponseError();
           }
-          await emitStepActions(emit, emissionState, stepResult, {
-            emittedActionCallIds,
-            excludedActionCallIds: invalidInputToolCallIds,
-            excludedActionToolNames,
-            handledInlineToolResultCallIds,
-            tools: presentationTools,
-          });
+          const skippedToolResults = answerSkippedToolCalls(stepResult, effectiveTools);
+          // Settle skipped calls with the step's other results, before step.completed.
+          await emitStepActions(
+            emit,
+            emissionState,
+            skippedToolResults.length === 0
+              ? stepResult
+              : withAccumulatedResponseMessages({
+                  responseMessages: appendMissingToolResultMessages({
+                    append: skippedToolResults,
+                    responseMessages: stepResult.response.messages,
+                  }),
+                  stepResult,
+                }),
+            {
+              emittedActionCallIds,
+              excludedActionCallIds: invalidInputToolCallIds,
+              excludedActionToolNames,
+              handledInlineToolResultCallIds,
+              tools: presentationTools,
+            },
+          );
           const existingToolResults = stepResult.toolResults as TypedToolResult<ToolSet>[];
           const toolResultsByCallId = new Map(
             existingToolResults.map((toolResult) => [toolResult.toolCallId, toolResult]),
@@ -1654,7 +1669,7 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
           return withAccumulatedResponseMessages({
             invalidInputToolCallIds,
             responseMessages: appendMissingToolResultMessages({
-              append: trailingInlineToolResultParts,
+              append: [...trailingInlineToolResultParts, ...skippedToolResults],
               responseMessages: accumulatedResponseMessages,
             }),
             stepResult,
@@ -1680,7 +1695,10 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
           throw new EmptyModelResponseError();
         }
         return withAccumulatedResponseMessages({
-          responseMessages: generateResult.responseMessages,
+          responseMessages: appendMissingToolResultMessages({
+            append: answerSkippedToolCalls(stepResult, effectiveTools),
+            responseMessages: generateResult.responseMessages,
+          }),
           stepResult,
         });
       };
@@ -2278,6 +2296,44 @@ function getInvalidToolCallInputErrors(input: {
   }
 
   return errors;
+}
+
+/**
+ * The AI SDK runs tools only when a step finishes with `stop` or `tool-calls`.
+ * A step cut short, such as at the output token limit, leaves the calls it
+ * would have run unanswered, and the next model call rejects that history.
+ * Answer each with an error so the model can call the tool again. Calls the
+ * SDK never runs (deferred tools, `final_output`) keep their usual handling.
+ */
+function answerSkippedToolCalls(step: HarnessStepResult, tools: ToolSet): ToolResultPart[] {
+  const { finishReason } = step;
+  if (finishReason === "stop" || finishReason === "tool-calls") return [];
+
+  const answeredCallIds = extractToolResultCallIds(step.response.messages);
+  const pendingApprovalCallIds = new Set(
+    (step.content ?? []).flatMap((part) =>
+      part.type === "tool-approval-request" && part.isAutomatic !== true
+        ? [part.toolCall.toolCallId]
+        : [],
+    ),
+  );
+  const value = `The tool did not run because the model response ended early (finish reason: ${finishReason}). Call the tool again if you still need its result.`;
+  return ((step.toolCalls ?? []) as TypedToolCall<ToolSet>[])
+    .filter(
+      (toolCall) =>
+        tools[toolCall.toolName]?.execute !== undefined &&
+        toolCall.providerExecuted !== true &&
+        !isInvalidToolCall(toolCall) &&
+        getInvalidToolCallInputError({ toolCall }) === undefined &&
+        !answeredCallIds.has(toolCall.toolCallId) &&
+        !pendingApprovalCallIds.has(toolCall.toolCallId),
+    )
+    .map((toolCall) => ({
+      output: { type: "error-text", value },
+      toolCallId: toolCall.toolCallId,
+      toolName: toolCall.toolName,
+      type: "tool-result",
+    }));
 }
 
 /**
