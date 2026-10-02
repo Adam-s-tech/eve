@@ -6,7 +6,11 @@ import { createTestRuntime } from "#internal/testing/app-harness.js";
 import { createBundledRuntimeCompiledArtifactsSource } from "#runtime/compiled-artifacts-source.js";
 import { getCompiledRuntimeAgentBundle } from "#runtime/sessions/compiled-agent-cache.js";
 import type { Session } from "#channel/session.js";
+import { z } from "#compiled/zod/index.js";
+import { always } from "#tools/approval/policies.js";
+import { defineTool } from "#tools/definition.js";
 import { askQuestion } from "#tools/provided/ask-question.js";
+import { getWorld } from "#internal/workflow/runtime.js";
 
 /** One outbound call a channel made to its platform API. */
 export interface PlatformCall {
@@ -74,9 +78,25 @@ export interface ChannelConversation {
   press(option: RenderedOption): Promise<void>;
   /** Waits until `tool` returns, as visible in the bot's reply, and returns its output. */
   waitForToolResult(tool: string): Promise<unknown>;
+  /** Waits until the bot's reply shows `tool` ran or was denied. */
+  waitForToolOutcome(tool: string): Promise<ToolOutcome>;
+  /** How many times {@link GATED_TOOL} actually executed, as its side effect would show. */
+  readonly gatedToolRuns: number;
 }
 
-const WAIT_TIMEOUT_MS = 10_000;
+/**
+ * How long to wait for a platform call. Steps finish in well under a second, so
+ * this mostly absorbs the first conversation's cold start on a busy machine.
+ */
+const WAIT_TIMEOUT_MS = 30_000;
+
+/** The test agent's tool that always needs a person's approval before it runs. */
+export const GATED_TOOL = "deploy_release";
+
+/** What a person sees once a tool call settles. */
+export type ToolOutcome =
+  | { readonly kind: "ran"; readonly output: unknown }
+  | { readonly kind: "denied" };
 
 /** A `fetch` for an HTTP platform API: `decode` turns each request into a call and its answer. */
 export function recordingFetch(
@@ -94,14 +114,18 @@ export function recordingFetch(
  * Runs `body` against an agent with `ask_question` and `driver`'s channel. Every
  * interaction goes through the channel's real webhook routes; the only fake is
  * the platform behind the channel, usually its injected `fetch`.
+ *
+ * Conversations must not overlap: each compiles its own agent, and concurrent
+ * ones can resolve each other's compiled artifacts in the shared workflow world.
  */
 export async function withChannelConversation(
   driver: ChannelDriver,
   body: (conversation: ChannelConversation) => Promise<void>,
+  options: { readonly waitTimeoutMs?: number } = {},
 ): Promise<void> {
   const calls: PlatformCall[] = [];
   try {
-    await converse(driver, calls, body);
+    await converse(driver, calls, body, options.waitTimeoutMs ?? WAIT_TIMEOUT_MS);
   } finally {
     driver.dispose?.();
   }
@@ -111,10 +135,12 @@ async function converse(
   driver: ChannelDriver,
   calls: PlatformCall[],
   body: (conversation: ChannelConversation) => Promise<void>,
+  waitTimeoutMs: number,
 ): Promise<void> {
   const created = driver.createChannel((call) => void calls.push(call));
   if (!isCompiledChannel(created)) throw new Error(`${driver.name} is not a compiled channel.`);
   const channel: CompiledChannel = created;
+  let gatedToolRuns = 0;
 
   const runtime = await createTestRuntime({
     agent: { name: `${driver.name}-hitl-conformance` },
@@ -122,6 +148,20 @@ async function converse(
       {
         logicalPath: "tools/ask_question.ts",
         loadNamespace: async () => ({ default: askQuestion() }),
+      },
+      {
+        logicalPath: `tools/${GATED_TOOL}.ts`,
+        loadNamespace: async () => ({
+          default: defineTool({
+            approval: always(),
+            description: `Deploys a release. Only call when asked to use ${GATED_TOOL}.`,
+            async execute() {
+              gatedToolRuns += 1;
+              return { deployed: true };
+            },
+            inputSchema: z.object({ release: z.string().optional() }),
+          }),
+        }),
       },
       {
         logicalPath: `channels/${driver.name}.ts`,
@@ -168,7 +208,7 @@ async function converse(
     }
 
     async function waitFor<T>(label: string, select: (call: PlatformCall) => T | undefined) {
-      const deadline = Date.now() + WAIT_TIMEOUT_MS;
+      const deadline = Date.now() + waitTimeoutMs;
       while (Date.now() < deadline) {
         for (const call of calls) {
           const selected = select(call);
@@ -184,26 +224,110 @@ async function converse(
     const conversation: ChannelConversation = {
       say: (text) => post(driver.message(text)),
       press: (option) => post(driver.press(option)),
-      waitForQuestion: (prompt) =>
-        waitFor(`the question "${prompt}"`, (call) => driver.findOptions(call, prompt)),
+      async waitForQuestion(prompt) {
+        const options = await waitFor(`the question "${prompt}"`, (call) =>
+          driver.findOptions(call, prompt),
+        );
+        await waitForTurnToHoldForInput();
+        return options;
+      },
       waitForToolResult: (tool) =>
         waitFor(`${tool} to return`, (call) => {
           const text = driver.postedText(call);
           return text === undefined ? undefined : readMockToolReply(text, tool);
         }),
+      waitForToolOutcome: (tool) =>
+        waitFor(`${tool} to run or be denied`, (call): ToolOutcome | undefined => {
+          const text = driver.postedText(call);
+          if (text === undefined) return undefined;
+          const output = readMockToolReply(text, tool);
+          if (output !== undefined) return { kind: "ran", output };
+          return isMockDenialReply(text) ? { kind: "denied" } : undefined;
+        }),
+      get gatedToolRuns() {
+        return gatedToolRuns;
+      },
     };
+
+    /** How many times each session's turn has held for input, as of the last wait. */
+    const inputHolds = new Map<string, number>();
+
+    /**
+     * A person answers once the bot has finished asking. Answering the moment
+     * the question appears races the channel's own bookkeeping for it, such as
+     * Discord aliasing the session to the message it just posted.
+     */
+    async function waitForTurnToHoldForInput(): Promise<void> {
+      const deadline = Date.now() + waitTimeoutMs;
+      while (Date.now() < deadline) {
+        for (const session of sessions.values()) {
+          const holds = await countInputHolds(session);
+          if (holds > (inputHolds.get(session.id) ?? 0)) {
+            inputHolds.set(session.id, holds);
+            return;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      throw new Error(`Timed out waiting for the turn to hold for input on ${driver.name}.`);
+    }
 
     function track(session: Session): Session {
       sessions.set(session.id, session);
       return session;
     }
 
+    // The test file's workflow world closes after its last test, so a session
+    // still writing then fails with an unhandled rejection.
+    const settle = () => Promise.all([...sessions.values()].map(cancelUntilResting));
     try {
       await body(conversation);
-    } finally {
-      await Promise.allSettled([...sessions.values()].map((session) => session.cancel()));
+    } catch (error) {
+      await settle().catch(() => {});
+      throw error;
     }
+    await settle();
   });
+}
+
+const TERMINAL_STEP_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+/**
+ * Cancels `session` until it waits for its next message with none of its steps
+ * still running. A turn that starts after the first cancel needs another.
+ */
+async function cancelUntilResting(session: Session): Promise<void> {
+  const world = await getWorld();
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await session.cancel();
+    const tail = await session.getStreamTailIndex();
+    const reader = (await session.getEventStream({ startIndex: tail })).getReader();
+    const last = await reader.read().finally(() => reader.cancel());
+    if (last.value?.type === "session.waiting") {
+      const steps = await world.steps.list({ resolveData: "none", runId: session.id });
+      if (steps.data.every((step) => TERMINAL_STEP_STATUSES.has(step.status))) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for session ${session.id} to rest.`);
+}
+
+async function countInputHolds(session: Session): Promise<number> {
+  const tail = await session.getStreamTailIndex();
+  if (tail < 0) return 0;
+  const reader = (await session.getEventStream({ startIndex: 0 })).getReader();
+  let holds = 0;
+  try {
+    for (let index = 0; index <= tail; index += 1) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.type === "turn.waiting" && value.data.on === "input") holds += 1;
+    }
+  } finally {
+    await reader.cancel();
+  }
+  return holds;
 }
 
 function findRoute(channel: CompiledChannel, request: Request) {
@@ -240,4 +364,9 @@ function readMockToolReply(text: string, tool: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+/** The test model reports a denied call's `execution-denied` result in its reply. */
+function isMockDenialReply(text: string): boolean {
+  return text.includes('"type":"execution-denied"');
 }
